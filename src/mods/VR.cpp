@@ -2106,6 +2106,88 @@ void VR::on_present() {
 
     m_fake_stereo_hook->on_frame();
 
+    // XRTV patch (resubmit-on-stall): Deliver Us Mars (and any UE game) can stop handing UEVR new frames for 100-500 ms
+    // during loads/videos while UEVR's frame loop only advances from Present. CloudXR's encoder then starves (frame
+    // interval HIGH, encoder 0x0) and the Quest client closes the stream (portal drop; headset 2026-10-03). A watchdog
+    // thread re-submits the last frame (last released eye images + UI layers, views re-located per frame) at the runtime
+    // rate whenever the present path has not submitted for XRTV_UEVR_RESUBMIT_MS. -1 / unset = off (upstream behaviour).
+    // It only runs while holding the VR mutex + sync_mtx, i.e. never inside the present path's own frame calls.
+    if (runtime->is_openxr()) {
+        static std::once_flag s_xrtv_resubmit_once{};
+        std::call_once(s_xrtv_resubmit_once, []() {
+            const char* v = std::getenv("XRTV_UEVR_RESUBMIT_MS");
+            const int ms = v != nullptr && v[0] != 0 ? std::atoi(v) : -1;
+            spdlog::info("[XRTV] resubmit-on-stall: XRTV_UEVR_RESUBMIT_MS={} ({})", ms, ms < 0 ? "off" : "re-submit the last frame while the game stalls");
+
+            if (ms < 0) {
+                return;
+            }
+
+            std::thread([ms]() {
+                const auto limit_ns = (long long)ms * 1000000LL;
+                bool stalled = false;
+                uint64_t count_at_stall = 0;
+
+                while (true) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+                    auto& vr = VR::get();
+
+                    if (vr == nullptr) {
+                        continue;
+                    }
+
+                    auto rt = vr->get_runtime();
+                    auto oxr = vr->get_openxr_runtime();
+
+                    if (rt == nullptr || oxr == nullptr || !rt->is_openxr() || !rt->loaded || !oxr->ever_submitted) {
+                        continue;
+                    }
+
+                    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    const auto last_ns = oxr->xrtv_last_main_end_ns.load();
+                    const bool is_stalled = last_ns > 0 && now_ns - last_ns > limit_ns;
+
+                    if (is_stalled != stalled) {
+                        stalled = is_stalled;
+
+                        if (stalled) {
+                            count_at_stall = oxr->xrtv_resubmit_count;
+                            spdlog::info("[XRTV] resubmit-on-stall: no frame from the game for {} ms -> re-submitting the last frame", ms);
+                        } else {
+                            spdlog::info("[XRTV] resubmit-on-stall: game frames resumed ({} frames re-submitted)", oxr->xrtv_resubmit_count - count_at_stall);
+                        }
+                    }
+
+                    if (!is_stalled) {
+                        continue;
+                    }
+
+                    auto& mtx = vr->get_vr_mutex();
+
+                    if (!mtx.try_lock()) {
+                        continue;
+                    }
+
+                    utility::ScopeGuard _unlock{[&mtx]() { mtx.unlock(); }};
+
+                    if (!vr->get_runtime()->is_openxr() || !oxr->ready()) {
+                        continue;
+                    }
+
+                    // Re-check under the lock: the present path may have submitted while we waited for it.
+                    const auto now2_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+
+                    if (now2_ns - oxr->xrtv_last_main_end_ns.load() <= limit_ns) {
+                        continue;
+                    }
+
+                    oxr->xrtv_resubmit_last_frame();
+                }
+            }).detach();
+        });
+    }
+
     auto openvr = get_runtime<runtimes::OpenVR>();
 
     if (runtime->is_openvr()) {

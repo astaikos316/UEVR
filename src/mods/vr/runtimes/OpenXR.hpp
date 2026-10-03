@@ -1,5 +1,8 @@
 #pragma once
 
+#include <chrono>
+#include <atomic>
+
 #include <unordered_set>
 #include <deque>
 
@@ -315,6 +318,16 @@ public:
     const ModToggle::Ptr ignore_vd_checks{ ModToggle::create("OpenXR_IgnoreVirtualDesktopChecks", false) };
     bool push_dummy_projection{ false };
     bool ever_submitted{false};
+
+    // XRTV patch (resubmit-on-stall), all guarded by sync_mtx: the last frame the PRESENT path submitted, kept by value so a
+    // watchdog can re-submit it (last released swapchain images, views re-located for a fresh xrWaitFrame) while the game
+    // renders nothing. XRTV_UEVR_RESUBMIT_MS (VR.cpp) arms it; off by default.
+    std::atomic<long long> xrtv_last_main_end_ns{0}; // steady_clock ns; atomic so the watchdog can poll it lock-free
+    std::vector<XrCompositionLayerProjectionView> xrtv_last_projection_views{};
+    std::vector<XrCompositionLayerQuad> xrtv_last_quads{};
+    std::vector<XrCompositionLayerCylinderKHR> xrtv_last_cylinders{};
+    uint64_t xrtv_resubmit_count{0};
+    XrResult xrtv_resubmit_last_frame();
     
     Mod::ValueList options{
         *resolution_scale,

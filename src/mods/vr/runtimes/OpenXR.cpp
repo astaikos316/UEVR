@@ -5,6 +5,7 @@
 #include <fstream>
 
 #include <spdlog/spdlog.h>
+#include <utility/Logging.hpp>
 
 #include <nlohmann/json.hpp>
 #include <utility/String.hpp>
@@ -1907,10 +1908,129 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
         }
     } else {
         this->ever_submitted = true;
+
+        // XRTV patch (resubmit-on-stall): remember what the present path just submitted (by value; depth dropped).
+        this->xrtv_last_main_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        if (!projection_layer_views.empty()) {
+            this->xrtv_last_projection_views = projection_layer_views;
+
+            for (auto& v : this->xrtv_last_projection_views) {
+                v.next = nullptr;
+            }
+
+            this->xrtv_last_quads.clear();
+            this->xrtv_last_cylinders.clear();
+
+            for (auto l : quad_layers) {
+                if (l == nullptr) {
+                    continue;
+                }
+
+                if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                    this->xrtv_last_quads.push_back(*(const XrCompositionLayerQuad*)l);
+                    this->xrtv_last_quads.back().next = nullptr;
+                } else if (l->type == XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR) {
+                    this->xrtv_last_cylinders.push_back(*(const XrCompositionLayerCylinderKHR*)l);
+                    this->xrtv_last_cylinders.back().next = nullptr;
+                }
+            }
+        }
     }
     
     this->frame_began = false;
     this->frame_synced = false;
+
+    return result;
+}
+
+// XRTV patch (resubmit-on-stall). Called by VR's watchdog thread with the VR mutex held (so never between the present
+// path's own frame calls) once the present path has not submitted for XRTV_UEVR_RESUBMIT_MS. Ends the currently begun
+// frame with the LAST submitted eye images + UI layers (OpenXR composites a swapchain's last released image), with
+// views located for this frame's own predicted display time (CloudXR looks poses up by exact time), then re-arms
+// wait + begin so the present path finds the same state it left (frame synced + begun).
+XrResult OpenXR::xrtv_resubmit_last_frame() {
+    std::scoped_lock _{sync_mtx};
+
+    if (!this->ready() || !this->got_first_poses || !this->ever_submitted || this->xrtv_last_projection_views.empty()) {
+        return XR_ERROR_SESSION_NOT_READY;
+    }
+
+    if (!this->frame_began) {
+        if (!this->frame_synced && this->synchronize_frame() != VRRuntime::Error::SUCCESS) {
+            return XR_ERROR_CALL_ORDER_INVALID;
+        }
+
+        this->begin_frame();
+
+        if (!this->frame_began) {
+            return XR_ERROR_CALL_ORDER_INVALID;
+        }
+    }
+
+    XrFrameState fs{XR_TYPE_FRAME_STATE};
+    {
+        std::scoped_lock __{this->sync_assignment_mtx};
+        fs = this->frame_state;
+    }
+
+    std::vector<XrCompositionLayerBaseHeader*> layers{};
+    std::vector<XrCompositionLayerProjectionView> views = this->xrtv_last_projection_views;
+    std::vector<XrView> located(views.size(), {XR_TYPE_VIEW});
+    XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+
+    if (fs.shouldRender == XR_TRUE && fs.predictedDisplayTime > 0) {
+        XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
+        locate_info.viewConfigurationType = this->view_config;
+        locate_info.displayTime = fs.predictedDisplayTime;
+        locate_info.space = this->stage_space;
+
+        XrViewState view_state{XR_TYPE_VIEW_STATE};
+        uint32_t count = 0;
+        const auto lr = xrLocateViews(this->session, &locate_info, &view_state, (uint32_t)located.size(), &count, located.data());
+
+        if (lr == XR_SUCCESS && count == views.size()) {
+            for (size_t i = 0; i < views.size(); ++i) {
+                views[i].pose = located[i].pose;
+                views[i].fov = located[i].fov;
+            }
+
+            projection.space = this->stage_space;
+            projection.viewCount = (uint32_t)views.size();
+            projection.views = views.data();
+            layers.push_back((XrCompositionLayerBaseHeader*)&projection);
+
+            for (auto& q : this->xrtv_last_quads) {
+                layers.push_back((XrCompositionLayerBaseHeader*)&q);
+            }
+
+            for (auto& c : this->xrtv_last_cylinders) {
+                layers.push_back((XrCompositionLayerBaseHeader*)&c);
+            }
+        }
+    }
+
+    XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
+    end_info.displayTime = fs.predictedDisplayTime;
+    end_info.environmentBlendMode = this->blend_mode;
+    end_info.layerCount = (uint32_t)layers.size();
+    end_info.layers = layers.data();
+
+    const auto result = xrEndFrame(this->session, &end_info);
+    this->frame_began = false;
+    this->frame_synced = false;
+
+    if (result != XR_SUCCESS) {
+        SPDLOG_ERROR_EVERY_N_SEC(1, "[XRTV] resubmit: xrEndFrame failed: {}", this->get_result_string(result));
+        return result;
+    }
+
+    ++this->xrtv_resubmit_count;
+
+    // Re-arm exactly like VR::on_post_present: the present path expects a synced + begun frame.
+    if (this->synchronize_frame() == VRRuntime::Error::SUCCESS) {
+        this->begin_frame();
+    }
 
     return result;
 }
