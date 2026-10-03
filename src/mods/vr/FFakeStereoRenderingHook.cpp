@@ -1,5 +1,7 @@
 #define NOMINMAX
 
+#include <atomic>
+#include "XrtvTrace.hpp"
 #include <windows.h>
 #include <winternl.h>
 
@@ -64,6 +66,10 @@
 
 FFakeStereoRenderingHook* g_hook = nullptr;
 uint32_t g_frame_count{};
+// XRTV patch (uevr-afr-eye-from-engine-tick): last ISceneViewExtension view-family frame number,
+// written only on the game thread (see pre-render hook), read by engine_tick_hook.
+std::atomic<uint32_t> g_xrtv_view_family_frame{};
+std::atomic<bool> xrtv::g_afr_from_tick{false};
 
 // Scan through function instructions to detect usage of double
 // floating point precision instructions.
@@ -438,6 +444,27 @@ void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float
         mod->on_pre_engine_tick(engine, delta);
     }
 
+    // XRTV patch (uevr-afr-eye-from-engine-tick): the AFR eye for the next rendered frame
+    // (g_frame_count) is only advanced in the UGameViewportClient::Draw hook. On UE 5.8 that hook is
+    // not found ("Failed to find UGameViewportClient::Draw!"), so g_frame_count stays 0: every frame
+    // renders the LEFT eye's offset + projection while present alternates the copies between the
+    // left and right swapchains -> the eyes show two unfusable views (cargame extreme compat).
+    // Mirror the Draw hook's g_frame_count = <last view-family frame number>, read from our own
+    // copy (internal_frame_count is also bumped by the present-driven pose update, which would race).
+    // Poses are NOT updated here: update_hmd_state in AFR locates only every other frame, and at
+    // tick time they are ~2 frames stale by submit -> CloudXR "Did not find pose" (measured: 133 ->
+    // 1000 per 150 s). The present-driven update (VR.cpp, uevr-xc-pose-update) keeps them fresh.
+    if (!hook->m_has_game_viewport_client_draw_hook && hook->m_has_view_extension_hook) {
+        auto vr = VR::get();
+
+        if (vr->is_hmd_active() && vr->is_using_afr()) {
+            SPDLOG_INFO_ONCE("[XRTV] No UGameViewportClient::Draw hook: advancing AFR eye from UGameEngine::Tick");
+            xrtv::g_afr_from_tick = true;
+            g_frame_count = g_xrtv_view_family_frame.load();
+            XRTV_EYE_TRACE("[XRTVEYE] T fam={} g={}", g_xrtv_view_family_frame.load(), g_frame_count);
+        }
+    }
+
     void* result = nullptr;
 
     {
@@ -488,6 +515,21 @@ bool pre_find_slate_thread() {
 }
 
 void FFakeStereoRenderingHook::attempt_hook_slate_thread(uintptr_t return_address, bool alternate) {
+    // XRTV patch (uevr-xc-no-slate-hook): in extreme compatibility mode UEVR mirrors the real back
+    // buffer (UI included) and never replaces the Slate UI target, so this hook buys nothing there.
+    // On UE 5.8 *Development* cooks the "UE 5.5 variant" viewport-offset emulation in
+    // slate_draw_window_render_thread leaves engine state that trips a check():
+    //   "Array index out of bounds ... [ArrayView.h:396]"  (cargame, xrtv title-container).
+    // So do not install the hook at all in that mode.
+    if (VR::get()->is_extreme_compatibility_mode_enabled()) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            SPDLOG_INFO("[XRTV] Extreme compatibility mode: not hooking FSlateRHIRenderer::DrawWindow_RenderThread");
+        }
+        return;
+    }
+
     if (m_asynchronous_scan->value()) {
         static std::future<bool> future = std::async(std::launch::async, detail::pre_find_slate_thread);
 
@@ -2195,10 +2237,51 @@ FRHITexture2D** FFakeStereoRenderingHook::viewport_get_render_target_texture_hoo
 
         std::optional<size_t> func_start{};
 
+        // XRTV (XRTV_UEVR_AHUD_FORCE_REDIRECT / XRTV_UEVR_AHUD_FORCE_ORIGINAL = comma-separated hex RVAs into the game
+        // exe, e.g. "1cd73ad,1cd73c7"): pin a caller's verdict without a rebuild. Lets us bisect which BL3 callers
+        // carry the Scaleform menu (borderlands3: menus landed in one eye; UEVR's UI layer stayed empty).
+        static const auto xrtv_parse_rvas = [](const char* name) {
+            std::unordered_set<uintptr_t> out{};
+            const auto e = std::getenv(name);
+            if (e == nullptr) {
+                return out;
+            }
+            const auto base = (uintptr_t)utility::get_executable();
+            std::string s{e};
+            size_t pos = 0;
+            while (pos < s.size()) {
+                const auto comma = s.find(',', pos);
+                const auto tok = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!tok.empty()) {
+                    out.insert(base + (uintptr_t)std::stoull(tok, nullptr, 16));
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                pos = comma + 1;
+            }
+            SPDLOG_INFO("[XRTV] {}: {} return address(es)", name, out.size());
+            return out;
+        };
+        static const auto xrtv_force_redirect = xrtv_parse_rvas("XRTV_UEVR_AHUD_FORCE_REDIRECT");
+        static const auto xrtv_force_original = xrtv_parse_rvas("XRTV_UEVR_AHUD_FORCE_ORIGINAL");
+
+        if (!data.seen_retaddrs.contains(retaddr)) {
+            if (xrtv_force_original.contains(retaddr)) {
+                SPDLOG_INFO("[XRTV] forced ORIGINAL (eye) @ {:x} (rva {:x})", retaddr, retaddr - (uintptr_t)utility::get_executable());
+                data.call_original_retaddrs.insert(retaddr);
+                return og(viewport);
+            }
+            if (xrtv_force_redirect.contains(retaddr)) {
+                SPDLOG_INFO("[XRTV] forced REDIRECT (UI) @ {:x} (rva {:x})", retaddr, retaddr - (uintptr_t)utility::get_executable());
+                data.redirected_retaddrs.insert(retaddr);
+            }
+        }
+
         // ALWAYS check the retaddr for ViewFamilyTexture first and never skip it
         // This will fix the case where we run into some other texture initially.
-        if (!data.seen_retaddrs.contains(retaddr)) {
-            SPDLOG_INFO("FViewport::GetRenderTargetTexture called from {:x}", retaddr);
+        if (!data.seen_retaddrs.contains(retaddr) && !data.redirected_retaddrs.contains(retaddr)) {
+            SPDLOG_INFO("FViewport::GetRenderTargetTexture called from {:x} (rva {:x})", retaddr, retaddr - (uintptr_t)utility::get_executable());
 
             func_start = utility::find_function_start(retaddr);
 
@@ -2320,7 +2403,11 @@ FRHITexture2D** FFakeStereoRenderingHook::viewport_get_render_target_texture_hoo
 
         // Hacky way to allow the first texture to go through
         // For the games that are using something other than ViewFamilyTexture as the scene RT.
-        if (!data.call_original_retaddrs.empty() && !data.redirected_retaddrs.contains(retaddr) && !data.has_view_family_tex) {
+        // XRTV (XRTV_UEVR_AHUD_NO_PASSTHROUGH): skip this passthrough so unclassified callers get the normal
+        // classification below. BL3 never shows a ViewFamilyTexture reference, so with the passthrough every caller
+        // after the first original one went straight into the eye image unexamined (incl. its Scaleform menu).
+        static const bool xrtv_no_passthrough = std::getenv("XRTV_UEVR_AHUD_NO_PASSTHROUGH") != nullptr;
+        if (!xrtv_no_passthrough && !data.call_original_retaddrs.empty() && !data.redirected_retaddrs.contains(retaddr) && !data.has_view_family_tex) {
             return og(viewport);
         }
 
@@ -2825,7 +2912,7 @@ struct SceneViewExtensionAnalyzer {
             }
         }
 
-        auto& vr = VR::get();
+        auto vr = VR::get();
         auto runtime = vr->get_runtime();
 
         auto call_orig = [=]() {
@@ -3464,6 +3551,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
 
     //vr->update_hmd_state(true, frame_count);
     auto runtime = vr->get_runtime();
+    g_xrtv_view_family_frame = frame_count;
     runtime->internal_frame_count = frame_count;
     runtime->on_pre_render_game_thread(frame_count);
 
@@ -4810,6 +4898,8 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         }
     }
 
+    XRTV_EYE_TRACE("[XRTVEYE] V vi={} ti={} g={} full={}", view_index, true_index, g_frame_count, is_full_pass);
+
     if (true_index == 0 && !is_full_pass) {
         if (has_double_precision) {
             g_hook->m_last_pre_rotation_double = *rot_d;
@@ -4939,6 +5029,7 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         const auto head_offset = quat_converter * (vqi_norm * (pos * world_scale));
         const auto head_offset_flat = quat_converter * (vqi_norm * (pos_flat * world_scale));
         const auto eye_separation = quat_converter * (glm::normalize(new_rotation) * (eye_offset * world_scale));
+        XRTV_GEOM_LOG("[XRTVEYE] S ti={} w2m={:.3f} world_scale={:.3f} eye_off=({:.4f},{:.4f},{:.4f}) eye_rot=({:.4f},{:.4f},{:.4f},{:.4f}) sep=({:.2f},{:.2f},{:.2f})", true_index, world_to_meters, world_scale, eye_offset.x, eye_offset.y, eye_offset.z, current_eye_rotation_offset.w, current_eye_rotation_offset.x, current_eye_rotation_offset.y, current_eye_rotation_offset.z, eye_separation.x, eye_separation.y, eye_separation.z);
 
         if (!has_double_precision) {
             if (!is_2d_screen) {
@@ -5044,6 +5135,17 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
             if (g_hook->m_tracking_system_hook != nullptr) {
                 g_hook->m_tracking_system_hook->manual_update_control_rotation();
             }
+        }
+    }
+
+    // XRTV debug (XRTV_UEVR_EYE_TAG): make the two AFR eyes trivially distinguishable in the image.
+    if (xrtv::eye_tag_on() && !is_full_pass) {
+        const auto tag_pitch = true_index == 0 ? 85.0 : -85.0;
+
+        if (has_double_precision) {
+            rot_d->pitch = tag_pitch;
+        } else {
+            view_rotation->pitch = (float)tag_pitch;
         }
     }
 
@@ -5186,6 +5288,23 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         } else {
             const auto fmat = VR::get()->get_projection_matrix((VRRuntime::Eye)(true_index));
             double_matrix = fmat;
+        }
+
+        // XRTV debug: per-frame projection trace + optional off-centre tag on eye 1.
+        if (g_hook->m_has_double_precision) {
+            if (xrtv::proj_tag_on() && true_index == xrtv::proj_tag_eye()) {
+                double_matrix[2][0] += 0.6;
+            }
+
+            XRTV_GEOM_LOG("[XRTVEYE] J vi={} ti={} g={} m00={:.4f} m11={:.4f} m20={:.4f} m21={:.4f}", view_index, true_index, g_frame_count,
+                double_matrix[0][0], double_matrix[1][1], double_matrix[2][0], double_matrix[2][1]);
+        } else {
+            if (xrtv::proj_tag_on() && true_index == xrtv::proj_tag_eye()) {
+                (*out)[2][0] += 0.6f;
+            }
+
+            XRTV_GEOM_LOG("[XRTVEYE] J vi={} ti={} g={} m00={:.4f} m11={:.4f} m20={:.4f} m21={:.4f}", view_index, true_index, g_frame_count,
+                (*out)[0][0], (*out)[1][1], (*out)[2][0], (*out)[2][1]);
         }
     } else {
         SPDLOG_ERROR("CalculateStereoProjectionMatrix returned nullptr!");

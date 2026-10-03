@@ -1,0 +1,276 @@
+diff --git a/src/sdk/FMalloc.cpp b/src/sdk/FMalloc.cpp
+index 2f77aee..dd6b67c 100644
+--- a/src/sdk/FMalloc.cpp
++++ b/src/sdk/FMalloc.cpp
+@@ -1,5 +1,6 @@
+ #include <unordered_set>
+ #include <algorithm>
++#include <cstdlib>
+ 
+ #include <utility/Scan.hpp>
+ #include <utility/Module.hpp>
+@@ -18,6 +19,34 @@ namespace sdk {
+ FMalloc* FMalloc::get() {
+     static FMalloc** result = []() -> FMalloc** {
+         ZoneScopedN("sdk::FMalloc::get static init");
++
++        // XRTV patch (uesdk-ue58-gmalloc): explicit GMalloc location + vtable indices from the game PDB.
++        // UE 5.8 grew the FMalloc vtable (FExec::Exec_Runtime/_Dev/_Editor), so the heuristic picked
++        // Malloc=7/Realloc=8/Free=13 (really Realloc/TryRealloc/GetAllocationSize) on a TBB instance
++        // instead of GMalloc -> heap corruption (cargame end58: GMalloc RVA 0x140eff90, indices 5/7/9).
++        {
++            auto read = [](const char* name, long long fallback) -> long long {
++                char buf[64]{};
++                const auto n = GetEnvironmentVariableA(name, buf, sizeof(buf));
++                if (n == 0 || n >= sizeof(buf)) {
++                    return fallback;
++                }
++                return std::strtoll(buf, nullptr, 0);
++            };
++
++            const auto rva = read("XRTV_GMALLOC_RVA", 0);
++            if (rva > 0) {
++                const auto var = (FMalloc**)((uintptr_t)GetModuleHandleW(nullptr) + (uintptr_t)rva);
++                s_malloc_index = (uint32_t)read("XRTV_GMALLOC_MALLOC_INDEX", 5);
++                s_realloc_index = (uint32_t)read("XRTV_GMALLOC_REALLOC_INDEX", 7);
++                s_free_index = (uint32_t)read("XRTV_GMALLOC_FREE_INDEX", 9);
++                SPDLOG_INFO("[FMalloc::get] XRTV override: GMalloc variable at 0x{:x} -> 0x{:x}, Malloc/Realloc/Free = {}/{}/{}",
++                            (uintptr_t)var, IsBadReadPtr(var, sizeof(void*)) ? 0 : (uintptr_t)*var,
++                            *s_malloc_index, *s_realloc_index, *s_free_index);
++                return var;
++            }
++        }
++
+         SPDLOG_INFO("[FMalloc::get] Finding GMalloc...");
+ 
+         const auto core_uobject = sdk::get_ue_module(L"CoreUObject");
+diff --git a/src/sdk/UObjectArray.cpp b/src/sdk/UObjectArray.cpp
+index 4bb0410..bc0b206 100644
+--- a/src/sdk/UObjectArray.cpp
++++ b/src/sdk/UObjectArray.cpp
+@@ -1,6 +1,7 @@
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <shared_mutex>
++#include <cstdlib>
+ 
+ #include <spdlog/spdlog.h>
+ #include <utility/Scan.hpp>
+@@ -86,6 +87,60 @@ UObjectBase* find_uobject(const std::wstring& full_name, bool cached) {
+     return nullptr;
+ }
+ 
++// XRTV patch (uesdk-ue58-uobjectarray). All values hex or decimal; only XRTV_GUOBJECTARRAY_RVA is
++// required. RVA is relative to the main module (monolithic game exe).
++//   XRTV_GUOBJECTARRAY_RVA            GUObjectArray RVA              (cargame end58.exe: 0x144eaa00)
++//   XRTV_GUOBJECTARRAY_OBJECTS_OFFSET FUObjectArray.ObjObjects       (UE 5.8: 0x0;  <=5.7: 0x10)
++//   XRTV_GUOBJECTARRAY_COUNT_OFFSET   NumElements within ObjObjects  (UE 5.8: 0x8)
++//   XRTV_GUOBJECTARRAY_ITEM_SIZE      sizeof(FUObjectItem)           (UE 5.8 Development: 0x20)
++//   XRTV_GUOBJECTARRAY_ITEM_OBJECT    offsetof(FUObjectItem, Object) (UE 5.8: 0x8)
++FUObjectArray* FUObjectArray::xrtv_env_override() {
++    auto read = [](const char* name, long long fallback) -> long long {
++        char buf[64]{};
++        const auto n = GetEnvironmentVariableA(name, buf, sizeof(buf));
++        if (n == 0 || n >= sizeof(buf)) {
++            return fallback;
++        }
++        return std::strtoll(buf, nullptr, 0);
++    };
++
++    const auto rva = read("XRTV_GUOBJECTARRAY_RVA", 0);
++    if (rva <= 0) {
++        return nullptr;
++    }
++
++    const auto module_base = (uintptr_t)GetModuleHandleW(nullptr);
++    auto result = (FUObjectArray*)(module_base + (uintptr_t)rva);
++
++    s_is_inlined_array = false;
++    s_is_chunked = true;
++    s_objects_offset = (size_t)read("XRTV_GUOBJECTARRAY_OBJECTS_OFFSET", OBJECTS_OFFSET);
++    s_count_offset_override = (int32_t)read("XRTV_GUOBJECTARRAY_COUNT_OFFSET", -1);
++    s_item_distance = (int32_t)read("XRTV_GUOBJECTARRAY_ITEM_SIZE", sizeof(FUObjectItem));
++    s_item_object_offset = (size_t)read("XRTV_GUOBJECTARRAY_ITEM_OBJECT", 0);
++    s_custom_objects_per_chunk = OBJECTS_PER_CHUNK;
++
++    SPDLOG_INFO("[FUObjectArray::get] XRTV override: GUObjectArray at 0x{:x} (rva 0x{:x}), objects_offset 0x{:x}, "
++                "count_offset {}, item_size 0x{:x}, item_object 0x{:x}",
++                (uintptr_t)result, rva, s_objects_offset, s_count_offset_override, s_item_distance, s_item_object_offset);
++
++    try {
++        const auto count = result->get_object_count();
++        const auto first = result->get_object(0);
++        SPDLOG_INFO("[FUObjectArray::get] XRTV override: {} objects, item0->object 0x{:x}", count,
++                    first != nullptr ? (uintptr_t)first->object : 0);
++        if (count <= 10 || first == nullptr || first->object == nullptr) {
++            SPDLOG_ERROR("[FUObjectArray::get] XRTV override looks wrong, ignoring it");
++            return nullptr;
++        }
++    } catch (...) {
++        SPDLOG_ERROR("[FUObjectArray::get] XRTV override faulted, ignoring it");
++        return nullptr;
++    }
++
++    return result;
++}
++
+ FUObjectArray* FUObjectArray::get() try {
+     static auto result = []() -> FUObjectArray* {
+         ZoneScopedN("sdk::FUObjectArray::get static init");
+@@ -419,6 +474,12 @@ FUObjectArray* FUObjectArray::get() try {
+             return utility::ExhaustionResult::BREAK;
+         });
+ 
++        // XRTV patch: an explicit override (from the PDB) wins over whatever the heuristic scan found,
++        // and resets the layout statics the scan may have set while testing wrong candidates.
++        if (auto xrtv = xrtv_env_override(); xrtv != nullptr) {
++            result = xrtv;
++        }
++
+         if (result == nullptr) {
+             SPDLOG_ERROR("[FUObjectArray::get] Failed to find GUObjectArray");
+             return nullptr;
+diff --git a/src/sdk/UObjectArray.hpp b/src/sdk/UObjectArray.hpp
+index ef74853..687bd4b 100644
+--- a/src/sdk/UObjectArray.hpp
++++ b/src/sdk/UObjectArray.hpp
+@@ -22,6 +22,11 @@ struct FUObjectItem {
+ struct FUObjectArray {
+     static FUObjectArray* get();
+ 
++    // XRTV patch: explicit GUObjectArray location/layout from the environment (values taken from the
++    // game's PDB), for builds the heuristic scan can't parse (UE 5.8: ObjObjects at +0, chunked-array
++    // fields reordered, FUObjectItem.Object at +0x08). Returns nullptr when not configured.
++    static FUObjectArray* xrtv_env_override();
++
+     static bool is_chunked() {
+         return s_is_chunked;
+     }
+@@ -31,25 +36,36 @@ struct FUObjectArray {
+     }
+ 
+     static size_t get_objects_offset() {
+-        return OBJECTS_OFFSET;
++        return s_objects_offset;
+     }
+ 
+     static size_t get_item_distance() {
+         return s_item_distance;
+     }
+ 
++    // XRTV patch (uesdk-ue58-uobjectarray): non-zero when the UE 5.8 FUObjectItem layout is in use
++    // (FlagsAndRefCount first, Object at +0x08). get_object() then returns items shifted so that
++    // item->object lands on the real Object field; item->flags is NOT valid in that mode.
++    static size_t get_item_object_offset() {
++        return s_item_object_offset;
++    }
++
+     int32_t get_object_count() {
++        if (s_count_offset_override >= 0) {
++            return *(int32_t*)((uintptr_t)this + s_objects_offset + s_count_offset_override);
++        }
++
+         if (s_is_inlined_array) {
+-            constexpr auto offs = OBJECTS_OFFSET + (MAX_INLINED_CHUNKS * sizeof(void*));
++            const auto offs = s_objects_offset + (MAX_INLINED_CHUNKS * sizeof(void*));
+             return *(int32_t*)((uintptr_t)this + offs);
+         }
+ 
+         if (s_is_chunked) {
+-            constexpr auto offs = OBJECTS_OFFSET + sizeof(void*) + sizeof(void*) + 0x4;
++            const auto offs = s_objects_offset + sizeof(void*) + sizeof(void*) + 0x4;
+             return *(int32_t*)((uintptr_t)this + offs);
+         }
+ 
+-        return *(int32_t*)((uintptr_t)this + OBJECTS_OFFSET + 0x8);
++        return *(int32_t*)((uintptr_t)this + s_objects_offset + 0x8);
+     }
+ 
+     FUObjectItem* get_object(int32_t index) {
+@@ -66,7 +82,7 @@ struct FUObjectArray {
+                 return nullptr;
+             }
+ 
+-            return (FUObjectItem*)((uintptr_t)chunk + (chunk_offset * s_item_distance));
++            return (FUObjectItem*)((uintptr_t)chunk + (chunk_offset * s_item_distance) + s_item_object_offset);
+         }
+ 
+         if (s_is_chunked) {
+@@ -78,18 +94,18 @@ struct FUObjectArray {
+                 return nullptr;
+             }
+ 
+-            return (FUObjectItem*)((uintptr_t)chunk + (chunk_offset * s_item_distance));
++            return (FUObjectItem*)((uintptr_t)chunk + (chunk_offset * s_item_distance) + s_item_object_offset);
+         }
+ 
+-        return (FUObjectItem*)((uintptr_t)get_objects_ptr() + (index * s_item_distance));
++        return (FUObjectItem*)((uintptr_t)get_objects_ptr() + (index * s_item_distance) + s_item_object_offset);
+     }
+ 
+     void* get_objects_ptr() {
+         if (s_is_inlined_array) {
+-            return (void*)((uintptr_t)this + OBJECTS_OFFSET);
++            return (void*)((uintptr_t)this + s_objects_offset);
+         }
+ 
+-        return *(void**)((uintptr_t)this + OBJECTS_OFFSET);
++        return *(void**)((uintptr_t)this + s_objects_offset);
+     }
+ 
+ public:
+@@ -109,5 +125,10 @@ private:
+     static inline bool s_uses_different_chunk_size{false};
+     static inline uint32_t s_custom_objects_per_chunk{OBJECTS_PER_CHUNK};
+     static inline int32_t s_item_distance{sizeof(FUObjectItem)}; // bruteforced later for older versions
++
++    // XRTV patch: layout overrides, set only by the XRTV_GUOBJECTARRAY_* environment override in get().
++    static inline size_t s_objects_offset{OBJECTS_OFFSET};
++    static inline int32_t s_count_offset_override{-1};
++    static inline size_t s_item_object_offset{0};
+ };
+ }
+\ No newline at end of file
+diff --git a/src/sdk/UObjectBase.cpp b/src/sdk/UObjectBase.cpp
+index 6dcae43..723482b 100644
+--- a/src/sdk/UObjectBase.cpp
++++ b/src/sdk/UObjectBase.cpp
+@@ -831,6 +831,12 @@ void UObjectBase::add_to_root() {
+         return;
+     }
+ 
++    // XRTV patch: UE 5.8 FUObjectItem layout (flags live in FlagsAndRefCount at the item base);
++    // item->flags is not valid through the shifted item pointer, so leave item flags alone.
++    if (sdk::FUObjectArray::get_item_object_offset() != 0) {
++        return;
++    }
++
+     auto object_item = sdk::FUObjectArray::get()->get_object(get_internal_index());
+ 
+     if (object_item == nullptr) {
+@@ -860,6 +866,12 @@ void UObjectBase::remove_from_root() {
+         return;
+     }
+ 
++    // XRTV patch: UE 5.8 FUObjectItem layout (flags live in FlagsAndRefCount at the item base);
++    // item->flags is not valid through the shifted item pointer, so leave item flags alone.
++    if (sdk::FUObjectArray::get_item_object_offset() != 0) {
++        return;
++    }
++
+     auto object_item = sdk::FUObjectArray::get()->get_object(get_internal_index());
+ 
+     if (object_item == nullptr) {
+@@ -892,6 +904,11 @@ bool UObjectBase::is_pending_kill_or_unreachable() const {
+         return true;
+     }
+ 
++    // XRTV patch: item flags not readable through the shifted UE 5.8 item pointer.
++    if (sdk::FUObjectArray::get_item_object_offset() != 0) {
++        return false;
++    }
++
+     return (object_item->flags & (1 << 29)) != 0;
+ }
+ }
+\ No newline at end of file

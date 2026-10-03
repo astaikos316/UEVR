@@ -1,4 +1,8 @@
 #include <Windows.h>
+#include "../XrtvTrace.hpp"
+#include <array>
+#include <cstdio>
+#include <optional>
 #include <TlHelp32.h>
 #include <chrono>
 #include <filesystem>
@@ -530,6 +534,26 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
             SPDLOG_INFO("Eye texture proportion scale: {} by {}", eye_width_adjustment, eye_height_adjustment);
         }
 
+        // XRTV debug (XRTV_UEVR_FAKE_FOV="L,R,U,D" = left-eye tangents, right eye mirrored): render as if
+        // the headset had this FOV, to test the image-based eye detector headlessly (the simulator's
+        // FOV is symmetric; real headsets are not). Only the rendered projection changes.
+        {
+            static const auto s_fake = []() -> std::optional<std::array<float, 4>> {
+                const auto e = std::getenv("XRTV_UEVR_FAKE_FOV");
+                std::array<float, 4> v{};
+                if (e == nullptr || std::sscanf(e, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) != 4) {
+                    return std::nullopt;
+                }
+                spdlog::info("[XRTV] FAKE_FOV left eye tangents {} {} {} {}", v[0], v[1], v[2], v[3]);
+                return v;
+            }();
+
+            if (s_fake) {
+                const auto& v = *s_fake;
+                tan_half_fov = eye == 0 ? std::array<float, 4>{v[0], v[1], v[2], v[3]} : std::array<float, 4>{-v[1], -v[0], v[2], v[3]};
+            }
+        }
+
         const auto left =   tan_half_fov[0];
         const auto right =  tan_half_fov[1];
         const auto top =    tan_half_fov[2];
@@ -694,6 +718,18 @@ OpenXR::PipelineState OpenXR::get_submit_state() {
 
     if (this->has_render_frame_count) {
         last_submit_state = this->pipeline_states[this->internal_render_frame_count % QUEUE_SIZE];
+
+        // XRTV patch (uevr-xc-no-slate-hook): in extreme compatibility mode the pipelined slot for
+        // the render frame is never filled by update_poses, so it has no stage views and end_frame
+        // submits NO projection layer ("[VR] No stage views to submit" every frame; CloudXR
+        // LayerCommitToGpuEnd never measured) -> black headset. Fall back to the current views,
+        // exactly as the non-pipelined branch below does.
+        if (last_submit_state.stage_views.empty()) {
+            last_submit_state.stage_views = get_current_stage_view();
+            last_submit_state.view_space_location = this->view_space_location;
+            last_submit_state.frame_state = this->frame_state;
+            last_submit_state.frame_count = this->internal_frame_count;
+        }
     } else {
         last_submit_state.stage_views = get_current_stage_view();
         last_submit_state.view_space_location = this->view_space_location;
@@ -720,6 +756,7 @@ void OpenXR::enqueue_render_poses(uint32_t frame_count) {
 }
 
 void OpenXR::enqueue_render_poses_unsafe(uint32_t frame_count) {
+    XRTV_EYE_TRACE("[XRTVEYE] E fc={} tid={}", frame_count, GetCurrentThreadId());
     this->internal_render_frame_count = frame_count;
     this->has_render_frame_count = true;
 }

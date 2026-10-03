@@ -1,6 +1,10 @@
 #define NOMINMAX
 
 #include <fstream>
+#include "vr/XrtvTrace.hpp"
+#include <algorithm>
+#include <array>
+#include <atomic>
 
 #include <windows.h>
 #include <dbt.h>
@@ -1517,8 +1521,15 @@ void VR::on_pre_viewport_client_draw(void* viewport_client, void* viewport, void
     }
 }
 
+// XRTV patch (uevr-xc-pose-update): counts update_hmd_state calls so on_present can tell whether any
+// engine hook updated the poses since the previous present.
+static std::atomic<uint64_t> s_xrtv_hmd_updates{0};
+static uint64_t s_xrtv_hmd_updates_seen{0};
+
 void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
     ZoneScopedN(__FUNCTION__);
+
+    ++s_xrtv_hmd_updates;
 
     std::scoped_lock _{m_reinitialize_mtx};
 
@@ -2054,6 +2065,119 @@ void VR::on_frame() {
     }
 }
 
+// XRTV patch (uevr-afr-present-parity): which AFR eye a present copies into.
+// Measured on cargame (UE 5.8, extreme compat, headless, eyes tagged by pitch + centre-pixel
+// readback): the image alternates eyes on EVERY present (1651/1651), but every frame-number signal
+// UEVR has at present races between the render and present threads (the carried render frame count
+// matches the real eye only ~67%, so v1.0.5 copied ~24% of frames into the wrong eye = flashing).
+// So: the eye alternates strictly per present, and the noisy signal only picks WHICH of the two
+// phases, by majority vote over the last 64 presents (offline replay on the measured run: 100%).
+// Returns the value to use as m_frame_count: its parity is the eye of the NEXT present.
+namespace xrtv {
+std::atomic<uint64_t> g_present_index{0};
+
+// Last 32 image observations, as agreement with phase 0 ("left on even presents"). Present thread only.
+static std::array<bool, 32> s_img_votes{};
+static size_t s_img_count{0};
+static int s_img_agree{0};
+static uint64_t s_img_last{0};
+
+void img_vote_push(uint64_t present, bool left) {
+    const bool agree = left == (present % 2 == 0);
+    const auto slot = s_img_count++ % s_img_votes.size();
+
+    if (s_img_count > s_img_votes.size()) {
+        s_img_agree -= s_img_votes[slot] ? 1 : 0;
+    }
+
+    s_img_votes[slot] = agree;
+    s_img_agree += agree ? 1 : 0;
+    s_img_last = present;
+}
+
+int img_vote_phase(uint64_t now) {
+    // Need a few observations, and recent ones (a static or symmetric-FOV scene gives none).
+    if (s_img_count < 8 || now > s_img_last + 512) {
+        return -1;
+    }
+
+    const auto votes = (int)std::min(s_img_count, s_img_votes.size());
+    return (s_img_agree * 2 < votes) ? 1 : 0;
+}
+}
+
+static uint32_t xrtv_present_parity_frame(uint32_t real_render_frame) {
+    static bool s_started{false};
+    static uint64_t s_present{0};
+    static uint32_t s_prev_real{0};
+    static uint32_t s_out{0};
+    static std::array<bool, 64> s_votes{};
+    static size_t s_vote_count{0};
+    static int s_agree{0};
+    // Signal polarity, measured with the eye tag: the image presented at p is the left eye when the
+    // render frame count seen at p-1 is EVEN with the default patch 3 (update_hmd_state re-publishes
+    // the count; signal right 76%), ODD with XRTV_UEVR_P3_SLOT (true render count; right 67%).
+    // XRTV_UEVR_EYE_POLARITY=even|odd overrides.
+    static const bool s_odd_is_left = [] {
+        const auto e = std::getenv("XRTV_UEVR_EYE_POLARITY");
+        if (e != nullptr && e[0] == 'o') return true;
+        if (e != nullptr && e[0] == 'e') return false;
+        return !xrtv::p3_enqueue_on();
+    }();
+    static const bool s_swap = std::getenv("XRTV_UEVR_SWAP_EYES") != nullptr;
+
+    if (!s_started) {
+        s_started = true;
+        s_prev_real = real_render_frame;
+        s_out = real_render_frame;
+        SPDLOG_INFO("[XRTV] AFR eye: present parity + phase vote (odd_is_left={}, swap={})", s_odd_is_left, s_swap);
+        return s_out;
+    }
+
+    const auto p = ++s_present;
+    xrtv::g_present_index = p;
+    const bool sig_left = ((s_prev_real % 2) == 1) == s_odd_is_left;
+    const bool agree = sig_left == (p % 2 == 0);   // agrees with phase 0: "left on even presents"
+    const auto slot = s_vote_count++ % s_votes.size();
+
+    if (s_vote_count > s_votes.size()) {
+        s_agree -= s_votes[slot] ? 1 : 0;
+    }
+
+    s_votes[slot] = agree;
+    s_agree += agree ? 1 : 0;
+    s_prev_real = real_render_frame;
+
+    const auto votes = (int)std::min(s_vote_count, s_votes.size());
+
+    // XRTV patch (uevr-afr-image-eye): prefer the image-based eye (D3D11Component: horizontal shift
+    // between consecutive presents; on an asymmetric-FOV headset the left image's content sits ~26%
+    // of the width further right). The timing-derived counter vote is only a fallback: its bias
+    // FLIPPED between the simulator and a real headset (v1.0.6 = eyes swapped in the headset).
+    const int img_phase = xrtv::img_vote_phase(p);
+    const bool base_phase1 = img_phase >= 0 ? (img_phase == 1) : (s_agree * 2 < votes);
+    const bool phase1 = base_phase1 != s_swap;
+
+    static int s_logged_state{-1};
+    const int state = (img_phase >= 0 ? 2 : 0) + (phase1 ? 1 : 0);
+
+    if (state != s_logged_state) {
+        SPDLOG_INFO("[XRTV] AFR eye phase {} from {} (present {}, counter agree {}/{}, swap {})",
+            phase1 ? 1 : 0, img_phase >= 0 ? "image" : "counter", p, s_agree, votes, s_swap);
+        s_logged_state = state;
+    }
+    const bool next_left = ((p + 1 + (phase1 ? 1 : 0)) % 2) == 0;
+    const uint32_t want_parity = next_left ? 0 : 1;   // m_left_eye_interval == 0
+
+    s_out += 1;
+    if ((s_out % 2) != want_parity) {
+        s_out += 1;   // phase change: skip one so the count stays monotonic
+    }
+
+    XRTV_EYE_TRACE("[XRTVEYE] Q p={} real={} out={} agree={}/{}", p, real_render_frame, s_out, s_agree, votes);
+    return s_out;
+}
+
 void VR::on_present() {
     ZoneScopedN(__FUNCTION__);
 
@@ -2068,6 +2192,11 @@ void VR::on_present() {
     }};
 
     m_frame_count = get_runtime()->internal_render_frame_count;
+    XRTV_EYE_TRACE("[XRTVEYE] P rf={} mrf={}", m_frame_count, m_render_frame_count);
+
+    if (xrtv::g_afr_from_tick.load() && is_extreme_compatibility_mode_enabled()) {
+        m_frame_count = xrtv_present_parity_frame(m_frame_count);
+    }
 
     if (!is_using_afr() || m_render_frame_count % 2 == m_left_eye_interval) {
         ResetEvent(m_present_finished_event);
@@ -2147,6 +2276,31 @@ void VR::on_present() {
 
             update_hmd_state();
         }
+
+        // XRTV patch (uevr-xc-pose-update): in extreme compatibility mode on UE 5.8 neither the
+        // scene-view-extension hook nor CalculateStereoViewOffset drives update_hmd_state, so after
+        // the first frame xrLocateViews is never called again. CloudXR then has no pose for any
+        // submitted frame ("Did not find pose for frame" on every frame) and never commits/encodes a
+        // layer -> black headset (cargame). If nothing updated the poses since the last present, do it
+        // here, right before the frame is copied and submitted.
+        if (is_extreme_compatibility_mode_enabled() && runtime->got_first_sync &&
+            s_xrtv_hmd_updates.load() == s_xrtv_hmd_updates_seen) {
+            SPDLOG_INFO_ONCE("[XRTV] Extreme compatibility mode: driving update_hmd_state from present");
+            XRTV_EYE_TRACE("[XRTVEYE] U");
+
+            if (xrtv::p3_enqueue_on()) {
+                update_hmd_state();
+            } else {
+                // update_hmd_state() here would take frame_count 0 -> ++internal_frame_count AND
+                // enqueue_render_poses(), overwriting the render frame count the NEXT present reads
+                // for its AFR eye (measured: ~200 duplicate/skip counts per 75 s -> both eyes get the
+                // same frame = flashing, and eye parity follows this counter instead of the frame).
+                // Locate straight into the slot this present will submit instead.
+                runtime->update_poses(false, runtime->internal_render_frame_count);
+                runtime->update_matrices(m_nearz, m_farz);
+            }
+        }
+        s_xrtv_hmd_updates_seen = s_xrtv_hmd_updates.load();
 
         m_is_d3d12 = false;
         e = m_d3d11.on_frame(this);

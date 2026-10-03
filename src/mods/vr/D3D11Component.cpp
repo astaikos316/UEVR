@@ -1,4 +1,7 @@
 #include <imgui.h>
+#include "XrtvTrace.hpp"
+#include <array>
+#include <cmath>
 #include <imgui_internal.h>
 #include <openvr.h>
 #include <d3dcompiler.h>
@@ -206,6 +209,179 @@ bool D3D11Component::TextureContext::clear_rtv(float* color) {
     return true;
 }
 
+// XRTV patch (uevr-afr-image-eye): identify which eye each presented AFR frame is, from the image.
+// On an asymmetric-FOV headset the left eye's frustum reaches further left, so the same scene sits
+// ~26% of the width further RIGHT in the left image than in the right image (plus IPD parallax, same
+// sign). Consecutive presents alternate eyes, so the horizontal shift between them names the eye.
+// 3 rows per present are copied to a staging ring and read back 2-3 presents later (no GPU stall).
+namespace {
+struct XrtvEyeDetector {
+    static constexpr int SLOTS = 4;
+    static constexpr int ROWS = 3;
+    static constexpr int SAMPLES = 240;
+    static constexpr int MAX_SHIFT = 90;   // samples (~37% of the width)
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> staging[SLOTS]{};
+    uint64_t slot_present[SLOTS]{};
+    bool slot_pending[SLOTS]{};
+    UINT width{};
+    UINT height{};
+    DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
+    bool supported{false};
+    std::array<float, ROWS * SAMPLES> prev{};
+    uint64_t prev_present{~0ull};
+};
+
+XrtvEyeDetector g_xrtv_det{};
+
+float xrtv_lum(const uint8_t* px, DXGI_FORMAT fmt) {
+    if (fmt == DXGI_FORMAT_R10G10B10A2_UNORM || fmt == DXGI_FORMAT_R10G10B10A2_TYPELESS) {
+        const auto v = *(const uint32_t*)px;
+        return (float)((v & 1023) + ((v >> 10) & 1023) + ((v >> 20) & 1023)) / 3069.0f;
+    }
+
+    return (float)(px[0] + px[1] + px[2]) / 765.0f;
+}
+
+void xrtv_eye_process(uint64_t q, const D3D11_MAPPED_SUBRESOURCE& mapped) {
+    auto& d = g_xrtv_det;
+    std::array<float, XrtvEyeDetector::ROWS * XrtvEyeDetector::SAMPLES> cur{};
+
+    for (int r = 0; r < XrtvEyeDetector::ROWS; ++r) {
+        const auto row = (const uint8_t*)mapped.pData + (size_t)r * mapped.RowPitch;
+
+        for (int i = 0; i < XrtvEyeDetector::SAMPLES; ++i) {
+            const auto x = (UINT)(((uint64_t)i * d.width) / XrtvEyeDetector::SAMPLES + d.width / (2 * XrtvEyeDetector::SAMPLES));
+            cur[r * XrtvEyeDetector::SAMPLES + i] = xrtv_lum(row + (size_t)x * 4, d.format);
+        }
+    }
+
+    if (d.prev_present + 1 == q) {
+        // err(s): mean |cur[i] - prev[i - s]|; s > 0 = the content moved RIGHT from q-1 to q.
+        auto err_at = [&](int s) {
+            float e = 0.0f;
+            int n = 0;
+
+            for (int r = 0; r < XrtvEyeDetector::ROWS; ++r) {
+                const auto base = r * XrtvEyeDetector::SAMPLES;
+
+                for (int i = std::max(0, s); i < std::min(XrtvEyeDetector::SAMPLES, XrtvEyeDetector::SAMPLES + s); ++i) {
+                    e += std::abs(cur[base + i] - d.prev[base + i - s]);
+                    ++n;
+                }
+            }
+
+            return n > 0 ? e / (float)n : 1.0f;
+        };
+
+        int best_s = 0;
+        float best_e = err_at(0);
+
+        for (int s = -XrtvEyeDetector::MAX_SHIFT; s <= XrtvEyeDetector::MAX_SHIFT; ++s) {
+            const auto e = err_at(s);
+
+            if (e < best_e) {
+                best_e = e;
+                best_s = s;
+            }
+        }
+
+        const auto e0 = err_at(0);
+        const auto e_mirror = err_at(-best_s);
+
+        // Confident only for a clear, non-trivial shift that beats the opposite shift by a margin.
+        const bool confident = std::abs(best_s) >= 4 && best_e < 0.7f * e_mirror && best_e < 0.8f * e0;
+
+        if (confident) {
+            xrtv::img_vote_push(q, best_s > 0);
+        }
+
+        XRTV_EYE_TRACE("[XRTVEYE] D q={} s={} e={:.4f} e0={:.4f} em={:.4f} conf={} left={}", q, best_s, best_e, e0, e_mirror, confident, best_s > 0);
+    }
+
+    d.prev = cur;
+    d.prev_present = q;
+}
+
+void xrtv_eye_detect(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* bb) {
+    if (!xrtv::eye_detect_on() || device == nullptr || context == nullptr || bb == nullptr) {
+        return;
+    }
+
+    auto& d = g_xrtv_det;
+    D3D11_TEXTURE2D_DESC desc{};
+    bb->GetDesc(&desc);
+
+    if (desc.Width != d.width || desc.Height != d.height || desc.Format != d.format) {
+        d = XrtvEyeDetector{};
+        d.width = desc.Width;
+        d.height = desc.Height;
+        d.format = desc.Format;
+        d.supported = desc.SampleDesc.Count == 1 && desc.Width >= XrtvEyeDetector::SAMPLES &&
+            (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM || desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
+             desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+             desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS);
+
+        for (int i = 0; i < XrtvEyeDetector::SLOTS && d.supported; ++i) {
+            auto sdesc = desc;
+            sdesc.Height = XrtvEyeDetector::ROWS;
+            sdesc.MipLevels = 1;
+            sdesc.ArraySize = 1;
+            sdesc.Usage = D3D11_USAGE_STAGING;
+            sdesc.BindFlags = 0;
+            sdesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            sdesc.MiscFlags = 0;
+
+            if (FAILED(device->CreateTexture2D(&sdesc, nullptr, &d.staging[i]))) {
+                d.supported = false;
+            }
+        }
+
+        spdlog::info("[XRTV] AFR image eye detector: backbuffer {}x{} format {} -> {}", desc.Width, desc.Height, (uint32_t)desc.Format, d.supported ? "enabled" : "UNSUPPORTED");
+    }
+
+    if (!d.supported) {
+        return;
+    }
+
+    const uint64_t p = xrtv::g_present_index.load();
+
+    // Harvest older copies in present order (p-3, then p-2), without waiting on the GPU.
+    for (uint64_t age = XrtvEyeDetector::SLOTS - 1; age >= 2; --age) {
+        if (p < age) {
+            continue;
+        }
+
+        const auto q = p - age;
+        const auto slot = (int)(q % XrtvEyeDetector::SLOTS);
+
+        if (!d.slot_pending[slot] || d.slot_present[slot] != q) {
+            continue;
+        }
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+
+        if (context->Map(d.staging[slot].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) == S_OK) {
+            xrtv_eye_process(q, mapped);
+            context->Unmap(d.staging[slot].Get(), 0);
+            d.slot_pending[slot] = false;
+        }
+    }
+
+    // Copy this present's rows (overwrites an unharvested p-4 copy, if any).
+    const auto slot = (int)(p % XrtvEyeDetector::SLOTS);
+
+    for (int r = 0; r < XrtvEyeDetector::ROWS; ++r) {
+        const UINT y = d.height * (UINT)(r + 1) / (UINT)(XrtvEyeDetector::ROWS + 1);
+        D3D11_BOX box{0, y, 0, d.width, y + 1, 1};
+        context->CopySubresourceRegion(d.staging[slot].Get(), 0, 0, (UINT)r, 0, bb, 0, &box);
+    }
+
+    d.slot_present[slot] = p;
+    d.slot_pending[slot] = true;
+}
+}
+
 vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
     if (m_force_reset || m_last_afr_state != vr->is_using_afr()) {
         if (!setup()) {
@@ -263,6 +439,7 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
     const auto is_afr = !is_same_frame && vr->is_using_afr();
     const auto is_left_eye_frame = is_afr && vr->m_render_frame_count % 2 == vr->m_left_eye_interval;
     const auto is_right_eye_frame = !is_afr || vr->m_render_frame_count % 2 == vr->m_right_eye_interval;
+    XRTV_EYE_TRACE("[XRTVEYE] C mrf={} same={} L={} R={}", vr->m_render_frame_count, is_same_frame, is_left_eye_frame, is_right_eye_frame);
 
     // Sometimes this can happen if pipeline execution does not go exactly as planned
     // so we need to resynchronized or begin the frame again.
@@ -293,6 +470,46 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
         }
 
         context->CopyResource(m_extreme_compat_backbuffer.Get(), backbuffer.Get());
+
+        // XRTV patch (uevr-afr-image-eye): feed the image-based AFR eye vote.
+        if (xrtv::g_afr_from_tick.load()) {
+            xrtv_eye_detect(device, context.Get(), real_backbuffer.Get());
+        }
+
+        // XRTV debug (XRTV_UEVR_EYE_TAG): read back the centre pixel of the frame being copied (stalls).
+        if (xrtv::eye_tag_on()) {
+            static ComPtr<ID3D11Texture2D> s_xrtv_staging{};
+            D3D11_TEXTURE2D_DESC bb_desc{};
+            real_backbuffer->GetDesc(&bb_desc);
+
+            if (s_xrtv_staging == nullptr) {
+                auto sdesc = bb_desc;
+                sdesc.Width = 1;
+                sdesc.Height = 1;
+                sdesc.MipLevels = 1;
+                sdesc.ArraySize = 1;
+                sdesc.SampleDesc.Count = 1;
+                sdesc.SampleDesc.Quality = 0;
+                sdesc.Usage = D3D11_USAGE_STAGING;
+                sdesc.BindFlags = 0;
+                sdesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                sdesc.MiscFlags = 0;
+                device->CreateTexture2D(&sdesc, nullptr, &s_xrtv_staging);
+                spdlog::info("[XRTVEYE] tag readback: backbuffer {}x{} format {}", bb_desc.Width, bb_desc.Height, (uint32_t)bb_desc.Format);
+            }
+
+            if (s_xrtv_staging != nullptr) {
+                D3D11_BOX box{bb_desc.Width / 2, bb_desc.Height / 2, 0, bb_desc.Width / 2 + 1, bb_desc.Height / 2 + 1, 1};
+                context->CopySubresourceRegion(s_xrtv_staging.Get(), 0, 0, 0, 0, backbuffer.Get(), 0, &box);
+
+                D3D11_MAPPED_SUBRESOURCE mapped{};
+                if (SUCCEEDED(context->Map(s_xrtv_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                    const auto px = *(uint32_t*)mapped.pData;
+                    context->Unmap(s_xrtv_staging.Get(), 0);
+                    XRTV_EYE_TRACE("[XRTVEYE] K px={:08x} mrf={} L={}", px, vr->m_render_frame_count, is_left_eye_frame);
+                }
+            }
+        }
 
         if (m_converted_backbuffer == nullptr) {
             D3D11_TEXTURE2D_DESC desc{};
