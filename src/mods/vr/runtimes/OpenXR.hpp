@@ -327,6 +327,9 @@ public:
     std::vector<XrCompositionLayerQuad> xrtv_last_quads{};
     std::vector<XrCompositionLayerCylinderKHR> xrtv_last_cylinders{};
     uint64_t xrtv_resubmit_count{0};
+    std::atomic<bool> xrtv_resubmitted{false};
+    std::atomic<bool> xrtv_resubmit_since_main{false}; // the present path's next end_frame must re-time + re-locate
+    std::atomic<long long> xrtv_in_release_since_ns{0}; // present thread inside xrReleaseSwapchainImage (D3D11Component) since // set by a resubmit; the present path then re-locates its views (VR.cpp stale-pose)
     XrResult xrtv_resubmit_last_frame();
     
     Mod::ValueList options{

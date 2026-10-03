@@ -2164,12 +2164,23 @@ void VR::on_present() {
                     }
 
                     auto& mtx = vr->get_vr_mutex();
+                    bool have_vr_mutex = mtx.try_lock();
 
-                    if (!mtx.try_lock()) {
-                        continue;
+                    if (!have_vr_mutex) {
+                        // The present path holds the VR mutex. The ONLY case where we may still submit is when it is parked in
+                        // xrReleaseSwapchainImage (wineopenxr draining DXVK, no OpenXR frame call in flight): the frame calls
+                        // themselves are serialised by sync_mtx, which the present path does not hold there.
+                        const auto rel_ns = oxr->xrtv_in_release_since_ns.load();
+
+                        if (rel_ns == 0 || now_ns - rel_ns < 20000000LL) {
+                            SPDLOG_INFO_EVERY_N_SEC(1, "[XRTV] resubmit-on-stall: stalled but the present path holds the VR mutex");
+                            continue;
+                        }
+
+                        SPDLOG_INFO_EVERY_N_SEC(1, "[XRTV] resubmit-on-stall: present path parked in xrReleaseSwapchainImage for {} ms -> re-submitting under sync_mtx only", (now_ns - rel_ns) / 1000000);
                     }
 
-                    utility::ScopeGuard _unlock{[&mtx]() { mtx.unlock(); }};
+                    utility::ScopeGuard _unlock{[&mtx, have_vr_mutex]() { if (have_vr_mutex) { mtx.unlock(); } }};
 
                     if (!vr->get_runtime()->is_openxr() || !oxr->ready()) {
                         continue;
@@ -2182,7 +2193,13 @@ void VR::on_present() {
                         continue;
                     }
 
-                    oxr->xrtv_resubmit_last_frame();
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const auto r = oxr->xrtv_resubmit_last_frame();
+                    const auto took_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+
+                    if (took_ms > 60 || r != XR_SUCCESS) {
+                        SPDLOG_INFO_EVERY_N_SEC(1, "[XRTV] resubmit-on-stall: resubmit took {} ms (result {})", took_ms, (int)r);
+                    }
                 }
             }).detach();
         });
@@ -2259,7 +2276,9 @@ void VR::on_present() {
 
         const bool engine_stale = std::chrono::steady_clock::now() - m_last_engine_tick > std::chrono::milliseconds(std::max(s_xrtv_stale_pose_ms, 0));
         const bool no_scene = !m_openxr->has_render_frame_count;
-        const bool stale = s_xrtv_stale_pose_ms >= 0 && (engine_stale || no_scene);
+        // resubmit-on-stall advanced the OpenXR frame behind our back: the pipelined views belong to an older prediction.
+        const bool resubmitted = m_openxr->xrtv_resubmitted.exchange(false);
+        const bool stale = (s_xrtv_stale_pose_ms >= 0 && (engine_stale || no_scene)) || resubmitted;
 
         if (stale != s_xrtv_stale) {
             s_xrtv_stale = stale;

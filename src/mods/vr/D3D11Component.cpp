@@ -2166,7 +2166,12 @@ void D3D11Component::OpenXR::copy(uint32_t swapchain_idx, ID3D11Texture2D* resou
             XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 
             LOG_VERBOSE("Releasing swapchain image for {}", swapchain_idx);
+            // XRTV patch (resubmit-on-stall): wineopenxr's D3D11 release first drains DXVK (FlushRenderingCommands), which
+            // waits behind the game's whole GPU backlog (Deliver Us Mars level loads: 170-300 ms) while this thread holds
+            // the VR mutex. Publish that, so the resubmit watchdog may keep CloudXR fed meanwhile (VR.cpp).
+            vr->m_openxr->xrtv_in_release_since_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
             auto result = xrReleaseSwapchainImage(swapchain.handle, &release_info);
+            vr->m_openxr->xrtv_in_release_since_ns = 0;
 
             if (result != XR_SUCCESS) {
                 spdlog::error("[VR] xrReleaseSwapchainImage failed: {}", vr->m_openxr->get_result_string(result));

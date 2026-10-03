@@ -1740,7 +1740,34 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
         has_depth = has_depth && this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::DEPTH);
     }
 
-    const auto submit_state = this->get_submit_state();
+    auto submit_state = this->get_submit_state();
+
+    // XRTV patch (resubmit-on-stall): a resubmit ended frames while this (present-path) frame was being prepared, so its
+    // pipelined views/display time belong to an older prediction (an older displayTime than the last submitted frame,
+    // and no located pose for it). Re-time this frame to the current xrWaitFrame prediction and re-locate its views.
+    if (this->xrtv_resubmit_since_main.exchange(false)) {
+        std::scoped_lock __{this->sync_assignment_mtx};
+
+        if (this->frame_state.predictedDisplayTime > 0 && !submit_state.stage_views.empty()) {
+            XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
+            li.viewConfigurationType = this->view_config;
+            li.displayTime = this->frame_state.predictedDisplayTime;
+            li.space = this->stage_space;
+
+            std::vector<XrView> located(submit_state.stage_views.size(), {XR_TYPE_VIEW});
+            XrViewState vs{XR_TYPE_VIEW_STATE};
+            uint32_t count = 0;
+
+            if (xrLocateViews(this->session, &li, &vs, (uint32_t)located.size(), &count, located.data()) == XR_SUCCESS && count == located.size()) {
+                for (size_t i = 0; i < located.size(); ++i) {
+                    submit_state.stage_views[i].pose = located[i].pose;
+                    submit_state.stage_views[i].fov = located[i].fov;
+                }
+
+                submit_state.frame_state = this->frame_state;
+            }
+        }
+    }
     const auto& pipelined_stage_views = submit_state.stage_views;
     const auto& pipelined_frame_state = submit_state.frame_state;
 
@@ -2026,6 +2053,8 @@ XrResult OpenXR::xrtv_resubmit_last_frame() {
     }
 
     ++this->xrtv_resubmit_count;
+    this->xrtv_resubmitted = true;
+    this->xrtv_resubmit_since_main = true;
 
     // Re-arm exactly like VR::on_post_present: the present path expects a synced + begun frame.
     if (this->synchronize_frame() == VRRuntime::Error::SUCCESS) {
