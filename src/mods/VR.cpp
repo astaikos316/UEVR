@@ -696,11 +696,21 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         // (UEVR spoofs a gamepad once real controllers are used), and this ran xrSyncActions — an IPC round trip to
         // the CloudXR/Monado service — on EVERY poll. The game thread lived in ipc_receive, the render thread's
         // xrBeginFrame starved on the same IPC channel, and the headset froze (audio only) for the whole video.
-        // Sync at most every 50 ms while the engine isn't ticking.
+        // XRTV_UEVR_LOADING_SYNC_MS: -1 = never sync while the engine isn't ticking (nobody can play during a load or a
+        // movie), 0 = every poll (upstream), N = at most every N ms (default 50). v1.1.2 (50 ms) still froze: the
+        // CloudXR service left a request unread in its IPC queue while its client thread slept in epoll_wait.
+        static const int s_xrtv_loading_sync_ms = []() {
+            const char* v = std::getenv("XRTV_UEVR_LOADING_SYNC_MS");
+            const int ms = v != nullptr && *v != '\0' ? std::atoi(v) : 50;
+            spdlog::info("[XRTV] loading-input-throttle: XRTV_UEVR_LOADING_SYNC_MS={} ({})", ms,
+                ms < 0 ? "no xrSyncActions while the engine is not ticking" : ms == 0 ? "upstream: every XInput poll" : "throttled");
+            return ms;
+        }();
         static std::chrono::steady_clock::time_point s_xrtv_last_loading_sync{};
         const auto sync_now = std::chrono::steady_clock::now();
 
-        if (sync_now - s_xrtv_last_loading_sync >= std::chrono::milliseconds(50)) {
+        if (s_xrtv_loading_sync_ms == 0 ||
+            (s_xrtv_loading_sync_ms > 0 && sync_now - s_xrtv_last_loading_sync >= std::chrono::milliseconds(s_xrtv_loading_sync_ms))) {
             s_xrtv_last_loading_sync = sync_now;
             update_action_states();
         }
