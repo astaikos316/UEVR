@@ -83,6 +83,8 @@ bool D3D11Hook::hook() {
 
         m_present_hook = std::make_unique<PointerHook>(&present_fn, (void*)&D3D11Hook::present);
         m_resize_buffers_hook = std::make_unique<PointerHook>(&resize_buffers_fn, (void*)&D3D11Hook::resize_buffers);
+        m_xrtv_present_slot = &present_fn;
+        m_xrtv_resize_slot = &resize_buffers_fn;
 
         m_hooked = true;
     } catch (const std::exception& e) {
@@ -94,6 +96,36 @@ bool D3D11Hook::hook() {
     context->Release();
     swap_chain->Release();
     return m_hooked;
+}
+
+// XRTV patch (present-guard): Borderlands 3 under Proton, 2026-10-03 — when the intro movie started, our Present
+// detour stopped being called for good (UEVR log: "Windows message hook is still intact, ignoring..." every 5 s,
+// encoder idle, headset frozen on the last menu frame + audio) while the game kept presenting (flat window live).
+// Upstream never re-hooks while its WndProc hook is intact. Re-assert our vtable entries if they were replaced.
+void D3D11Hook::xrtv_check_present_slot() {
+    if (!m_hooked || m_xrtv_present_slot == nullptr || IsBadReadPtr(m_xrtv_present_slot, sizeof(void*))) {
+        return;
+    }
+
+    const auto current = *m_xrtv_present_slot;
+    const auto ours = (void*)&D3D11Hook::present;
+
+    if (current != ours) {
+        spdlog::warn("[XRTV] present-guard: D3D11 Present vtable slot {:x} holds {:x}, not our hook {:x} -> restoring",
+            (uintptr_t)m_xrtv_present_slot, (uintptr_t)current, (uintptr_t)ours);
+
+        if (m_present_hook != nullptr) {
+            m_present_hook->restore();
+        }
+
+        if (m_resize_buffers_hook != nullptr && m_xrtv_resize_slot != nullptr && *m_xrtv_resize_slot != (void*)&D3D11Hook::resize_buffers) {
+            m_resize_buffers_hook->restore();
+        }
+
+        spdlog::warn("[XRTV] present-guard: slot now {:x}", (uintptr_t)*m_xrtv_present_slot);
+    } else {
+        spdlog::info("[XRTV] present-guard: no Present for 5 s but the vtable slot {:x} is still ours -> the game presents another way", (uintptr_t)m_xrtv_present_slot);
+    }
 }
 
 bool D3D11Hook::unhook() {

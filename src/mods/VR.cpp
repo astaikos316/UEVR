@@ -691,7 +691,19 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
     if (std::chrono::steady_clock::now() - m_last_engine_tick > std::chrono::seconds(1)) {
         SPDLOG_INFO_EVERY_N_SEC(1, "[VR] XInputGetState called, but engine tick hasn't been called in over a second. Is the game loading?");
-        update_action_states();
+
+        // XRTV patch (loading-input-throttle): Borderlands 3 polls XInput non-stop while it loads / plays a movie
+        // (UEVR spoofs a gamepad once real controllers are used), and this ran xrSyncActions — an IPC round trip to
+        // the CloudXR/Monado service — on EVERY poll. The game thread lived in ipc_receive, the render thread's
+        // xrBeginFrame starved on the same IPC channel, and the headset froze (audio only) for the whole video.
+        // Sync at most every 50 ms while the engine isn't ticking.
+        static std::chrono::steady_clock::time_point s_xrtv_last_loading_sync{};
+        const auto sync_now = std::chrono::steady_clock::now();
+
+        if (sync_now - s_xrtv_last_loading_sync >= std::chrono::milliseconds(50)) {
+            s_xrtv_last_loading_sync = sync_now;
+            update_action_states();
+        }
     }
 
     if (*retval == ERROR_SUCCESS) {

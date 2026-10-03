@@ -45,6 +45,10 @@ public:
     auto get_swapchain_1() { return m_swapchain_1; }
     auto& get_last_depthstencil_used() { return m_last_depthstencil_used; }
 
+    // XRTV patch (present-guard): called by the hook monitor when no Present reached us for 5 s although the
+    // game window is alive. Re-asserts our vtable hooks if something replaced them, and logs what it found.
+    void xrtv_check_present_slot();
+
 protected:
     template<typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
@@ -60,6 +64,8 @@ protected:
 
     std::unique_ptr<PointerHook> m_present_hook{};
     std::unique_ptr<PointerHook> m_resize_buffers_hook{};
+    void** m_xrtv_present_slot{nullptr};
+    void** m_xrtv_resize_slot{nullptr};
     std::unique_ptr<PointerHook> m_set_render_targets_hook{};
     OnPresentFn m_on_present{ nullptr };
     OnPresentFn m_on_post_present{ nullptr };
