@@ -1,0 +1,9 @@
+#pragma once 
+#define UEVR_COMMIT_HASH "4ee5c6b6162dee2291fc75f9dfc57667f6d45a2d" 
+#define UEVR_TAG "1.05" 
+#define UEVR_TAG_LONG "1.05" 
+#define UEVR_COMMITS_PAST_TAG 195 
+#define UEVR_BRANCH "xrtv/cargame" 
+#define UEVR_TOTAL_COMMITS 1429 
+#define UEVR_BUILD_DATE "03.10.2026" 
+#define UEVR_BUILD_TIME "14:42" 
