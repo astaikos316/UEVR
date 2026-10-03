@@ -697,8 +697,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         // the CloudXR/Monado service — on EVERY poll. The game thread lived in ipc_receive, the render thread's
         // xrBeginFrame starved on the same IPC channel, and the headset froze (audio only) for the whole video.
         // XRTV_UEVR_LOADING_SYNC_MS: -1 = never sync while the engine isn't ticking (nobody can play during a load or a
-        // movie), 0 = every poll (upstream), N = at most every N ms (default 50). v1.1.2 (50 ms) still froze: the
-        // CloudXR service left a request unread in its IPC queue while its client thread slept in epoll_wait.
+        // movie), 0 = every poll (upstream), N = at most every N ms (default 50). NOTE: this was NOT the video-freeze cause
+        // (that was stale-pose, see on_present); kept because BL3 shipped headset-verified with -1.
         static const int s_xrtv_loading_sync_ms = []() {
             const char* v = std::getenv("XRTV_UEVR_LOADING_SYNC_MS");
             const int ms = v != nullptr && *v != '\0' ? std::atoi(v) : 50;
@@ -2159,45 +2159,29 @@ void VR::on_present() {
         }
     }
 
-    // XRTV patch (stale-pose): Borderlands 3 plays its videos with the engine tick stopped while Slate keeps
-    // presenting (the movie reaches the VR UI quad). UEVR only locates views from the engine tick, so every frame
-    // submitted during a video had no xrLocateViews for its display time; CloudXR's server then finds no pose for the
-    // frame, stops encoding (encoder 0x0, 256 ms keepalives) and the headset froze with audio for the whole video.
-    // While the engine is stale, locate views here for the frame about to be submitted, at the latest xrWaitFrame
-    // time. XRTV_UEVR_STALE_POSE_MS: engine-tick age that counts as stale (default 100), -1 = off (upstream).
+    // XRTV patch (stale-pose): Borderlands 3 plays its videos with the engine ticking but no scene rendered, while
+    // Slate keeps presenting (the movie reaches the VR UI quad). UEVR locates views only for rendered scene frames, so
+    // every frame submitted during a video carried views located for a different display time; CloudXR then found no
+    // pose for any frame, stopped encoding (encoder 0x0, 256 ms keepalives) and the headset froze with audio for the
+    // whole video. When no scene frame was enqueued since the last submit (or the engine tick is stale), locate views
+    // here at the latest xrWaitFrame time. XRTV_UEVR_STALE_POSE_MS: engine-tick age that counts as stale (default 100),
+    // -1 = off (upstream behaviour).
     if (runtime->is_openxr() && runtime->ready() && runtime->got_first_sync && is_left_eye_frame) {
         static const int s_xrtv_stale_pose_ms = []() {
             const char* v = std::getenv("XRTV_UEVR_STALE_POSE_MS");
             const int ms = v != nullptr && *v != '\0' ? std::atoi(v) : 100;
-            spdlog::info("[XRTV] stale-pose: XRTV_UEVR_STALE_POSE_MS={} ({})", ms, ms < 0 ? "off" : "locate views at present while the engine is stale");
+            spdlog::info("[XRTV] stale-pose: XRTV_UEVR_STALE_POSE_MS={} ({})", ms, ms < 0 ? "off" : "locate views at present when no scene frame was rendered");
             return ms;
         }();
         static bool s_xrtv_stale = false;
-        static uint32_t s_xrtv_n_engine_stale = 0, s_xrtv_n_no_scene = 0, s_xrtv_n_total = 0;
-        static auto s_xrtv_last_report = std::chrono::steady_clock::now();
 
-        // Two ways a submitted frame ends up with no located views: the engine tick stopped, or the engine ticks but
-        // renders no scene (no view family -> no enqueue_render_poses, so get_submit_state() falls back to views located
-        // for a different display time than the one submitted).
-        const auto now = std::chrono::steady_clock::now();
         const bool engine_stale = std::chrono::steady_clock::now() - m_last_engine_tick > std::chrono::milliseconds(std::max(s_xrtv_stale_pose_ms, 0));
         const bool no_scene = !m_openxr->has_render_frame_count;
         const bool stale = s_xrtv_stale_pose_ms >= 0 && (engine_stale || no_scene);
 
-        ++s_xrtv_n_total;
-        s_xrtv_n_engine_stale += engine_stale ? 1 : 0;
-        s_xrtv_n_no_scene += no_scene ? 1 : 0;
-
-        if (now - s_xrtv_last_report >= std::chrono::seconds(5)) {
-            spdlog::info("[XRTV] stale-pose: last 5 s: {} presents, {} engine-stale, {} without a scene frame", s_xrtv_n_total, s_xrtv_n_engine_stale, s_xrtv_n_no_scene);
-            s_xrtv_n_total = s_xrtv_n_engine_stale = s_xrtv_n_no_scene = 0;
-            s_xrtv_last_report = now;
-        }
-
         if (stale != s_xrtv_stale) {
             s_xrtv_stale = stale;
-            spdlog::info("[XRTV] stale-pose: {} -> {}", stale ? (engine_stale ? "engine tick stopped" : "no scene frame") : "scene frames resumed",
-                stale ? "locating views at present" : "back to engine-tick poses");
+            SPDLOG_INFO_EVERY_N_SEC(1, "[XRTV] stale-pose: {}", stale ? "no scene frame -> locating views at present" : "scene frames resumed");
         }
 
         if (stale) {

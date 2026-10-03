@@ -130,11 +130,6 @@ void Framework::hook_monitor() {
 
         if (m_initialized && m_wnd != 0 && now - m_last_message_time > std::chrono::seconds(5)) {
             if (m_windows_message_hook != nullptr && m_windows_message_hook->is_hook_intact()) {
-                // XRTV patch (present-guard): the window is alive, so a silent Present may be a lost hook.
-                if (m_is_d3d11 && d3d11 != nullptr) {
-                    d3d11->xrtv_check_present_slot();
-                }
-
                 spdlog::info("Windows message hook is still intact, ignoring...");
                 m_last_message_time = now;
                 m_last_sendmessage_time = now;
