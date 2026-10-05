@@ -161,6 +161,8 @@ struct VRRuntime {
     bool handle_select_button{false}; // long press on pause button
     bool was_pause_button_pressed{false};
     bool wants_reset_origin{true};
+    // XRTV patch (origin-follow): when to re-take the standing origin after fov-follow saw the headset's view arrive
+    std::chrono::steady_clock::time_point xrtv_standing_origin_at{};
 
     std::chrono::steady_clock::time_point last_pause_press{};
     std::chrono::steady_clock::time_point last_select_press{};
