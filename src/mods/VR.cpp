@@ -1,5 +1,6 @@
 #define NOMINMAX
 
+#include <filesystem>
 #include <fstream>
 
 #include <windows.h>
@@ -30,9 +31,41 @@ std::shared_ptr<VR>& VR::get() {
     return g_framework->vr();
 }
 
+// XRTV patch (defer-runtime): XRTV_UEVR_DEFER_RUNTIME=<Windows path of a marker file>. Injecting UEVR costs ~20 s of
+// scans + hook installs after the game's first frame, all of which used to run after the viewer pressed Enter VR,
+// because the OpenXR runtime can't be started without a connected CloudXR client (xrCreateInstance hangs). With this
+// set, UEVR is injected early (no client): the runtime is skipped -- the game keeps rendering flat while the hooks
+// engage -- and initialized on the render thread once the startup script creates the marker (client connected).
+static std::string& xrtv_defer_runtime_marker() {
+    static std::string marker = [] {
+        const char* v = std::getenv("XRTV_UEVR_DEFER_RUNTIME");
+        return v != nullptr ? std::string{v} : std::string{};
+    }();
+    return marker;
+}
+
+static bool& xrtv_defer_runtime_released() {
+    static bool released = false;
+    return released;
+}
+
+static bool xrtv_defer_runtime_pending() {
+    return !xrtv_defer_runtime_marker().empty() && !xrtv_defer_runtime_released();
+}
+
 // Called when the mod is initialized
 std::optional<std::string> VR::clean_initialize() try {
     ZoneScopedN(__FUNCTION__);
+
+    if (xrtv_defer_runtime_pending()) {
+        if (std::filesystem::exists(xrtv_defer_runtime_marker())) {
+            xrtv_defer_runtime_released() = true; // client already there: initialize normally
+            spdlog::info("[XRTV] defer-runtime: {} already exists -> initializing now", xrtv_defer_runtime_marker());
+        } else {
+            spdlog::info("[XRTV] defer-runtime: holding the VR runtime until {} exists", xrtv_defer_runtime_marker());
+            return Mod::on_initialize();
+        }
+    }
 
     auto openvr_error = initialize_openvr();
 
@@ -2113,6 +2146,28 @@ void VR::on_present() {
 
     if (!runtime->loaded) {
         m_fake_stereo_hook->on_frame(); // Just let all the hooks engage, whatever.
+
+        // XRTV patch (defer-runtime): the runtime was held back at injection; bring it up once the marker exists.
+        if (xrtv_defer_runtime_pending()) {
+            static auto last_check = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+
+            if (now - last_check >= std::chrono::milliseconds(100)) {
+                last_check = now;
+
+                if (std::filesystem::exists(xrtv_defer_runtime_marker())) {
+                    xrtv_defer_runtime_released() = true;
+                    spdlog::info("[XRTV] defer-runtime: {} exists -> initializing the VR runtime", xrtv_defer_runtime_marker());
+                    clean_initialize();
+                    // swapchains are created by the first config load that sees a loaded runtime (on_config_load)
+                    g_framework->deferred_reload_config();
+                    m_fake_stereo_hook->set_should_recreate_textures(true);
+                    spdlog::info("[XRTV] defer-runtime: runtime {} ({})", get_runtime()->loaded ? "loaded" : "NOT loaded",
+                        get_runtime()->error ? *get_runtime()->error : std::string{"no error"});
+                }
+            }
+        }
+
         return;
     }
 
