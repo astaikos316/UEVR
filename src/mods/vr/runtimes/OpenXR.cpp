@@ -609,6 +609,19 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
         if (changed) {
             spdlog::info("[XRTV] fov-follow: runtime FOV changed -> re-deriving eye projections");
             this->should_recalculate_eye_projections = true;
+
+            // XRTV patch (origin-follow): the headset's view has arrived, so its head pose is real now -> re-take the
+            // standing origin (VR::update_hmd_state) after XRTV_UEVR_ORIGIN_FOLLOW_MS (default 1000, -1 = off).
+            static const int origin_follow_ms = [] {
+                const char* v = std::getenv("XRTV_UEVR_ORIGIN_FOLLOW_MS");
+                const int ms = v != nullptr ? std::atoi(v) : 1000;
+                spdlog::info("[XRTV] origin-follow: XRTV_UEVR_ORIGIN_FOLLOW_MS={}", ms);
+                return ms;
+            }();
+
+            if (origin_follow_ms >= 0) {
+                this->xrtv_standing_origin_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(origin_follow_ms);
+            }
         }
     }
 
