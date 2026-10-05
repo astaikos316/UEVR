@@ -1593,6 +1593,20 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
         runtime->wants_reset_origin = false;
     }
 
+    // XRTV patch (origin-follow): the standing origin above is taken from the FIRST valid HMD pose, which under CloudXR
+    // is a session-start placeholder, not the viewer's head -> the whole session sits too low (Borderlands 3 headset
+    // 2026-10-05; the UEVR menu's "Set Standing Origin" fixed it). fov-follow schedules a re-take once the headset's
+    // real view has been applied; do exactly what that button does (position only, no recenter).
+    if (runtime->xrtv_standing_origin_at != std::chrono::steady_clock::time_point{} &&
+        std::chrono::steady_clock::now() >= runtime->xrtv_standing_origin_at && runtime->ready() && runtime->got_first_valid_poses) {
+        std::unique_lock _{ runtime->pose_mtx };
+        const auto old_origin = m_standing_origin;
+        m_standing_origin = get_position_unsafe(vr::k_unTrackedDeviceIndex_Hmd);
+        runtime->xrtv_standing_origin_at = {};
+        spdlog::info("[XRTV] origin-follow: standing origin ({:.3f}, {:.3f}, {:.3f}) -> ({:.3f}, {:.3f}, {:.3f})",
+            old_origin.x, old_origin.y, old_origin.z, m_standing_origin.x, m_standing_origin.y, m_standing_origin.z);
+    }
+
     runtime->update_matrices(m_nearz, m_farz);
 
     runtime->got_first_poses = true;
