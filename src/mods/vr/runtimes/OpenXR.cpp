@@ -577,6 +577,41 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
         };
     };
 
+    // XRTV patch (fov-follow): CloudXR reports a symmetric placeholder FOV (tan -2.02/2.02/1.08/-1.08, 1024x1024) until
+    // the headset's view request is applied, which can land AFTER the projections were first derived. Stock UEVR never
+    // re-derives them, yet every frame is submitted with the runtime's CURRENT per-eye fov -> the compositor displays
+    // each eye with a different frustum than it was rendered with = misaligned eyes (Borderlands 3 headset 2026-10-05).
+    // Re-derive whenever the located fov moves off the one the projections were built from.
+    // XRTV_UEVR_FOV_FOLLOW=0 disables.
+    static const bool xrtv_fov_follow = [] {
+        const char* v = std::getenv("XRTV_UEVR_FOV_FOLLOW");
+        const bool on = v == nullptr || v[0] != '0';
+        spdlog::info("[XRTV] fov-follow: {}", on ? "on" : "off (XRTV_UEVR_FOV_FOLLOW=0)");
+        return on;
+    }();
+
+    if (xrtv_fov_follow && this->projections[0][2][3] != 0 && !this->should_recalculate_eye_projections) {
+        constexpr float eps = 1e-3f;
+        bool changed = false;
+
+        for (auto eye = 0; eye < 2 && !changed; ++eye) {
+            const auto& fov = this->views[eye].fov;
+            const float cur[4]{tan(fov.angleLeft), tan(fov.angleRight), tan(fov.angleUp), tan(fov.angleDown)};
+
+            for (auto i = 0; i < 4; ++i) {
+                if (std::abs(cur[i] - this->raw_projections[eye][i]) > eps) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+
+        if (changed) {
+            spdlog::info("[XRTV] fov-follow: runtime FOV changed -> re-deriving eye projections");
+            this->should_recalculate_eye_projections = true;
+        }
+    }
+
     // if we've not yet derived an eye projection matrix, or we've changed the projection, derive it here
     // Hacky way to check for an uninitialised eye matrix - is there something better, is this necessary?
     if (this->should_recalculate_eye_projections || this->last_eye_matrix_nearz != nearz || this->projections[0][2][3] == 0) {
